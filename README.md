@@ -216,7 +216,7 @@ cd ./project && ./replace_files.sh -d tree/dash -- -weird.conf
 Run the regression suite:
 
 ```sh
-bash tests/test_replace_files.sh           # default
+bash tests/test_replace_files.sh          # default
 bash tests/test_replace_files.sh -q       # failures + summary only
 bash tests/test_replace_files.sh -v       # verbose
 ```
