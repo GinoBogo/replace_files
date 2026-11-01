@@ -15,10 +15,13 @@
 #
 # Author: Gino Bogo
 # Date: 2026-11
-# Version: 1.0
+# Version: 1.1
 # ==============================================================================
 
 set -uo pipefail
+
+# find(1) localises its diagnostics; the checks below match English text.
+export LC_ALL=C
 
 # --- locate the script under test from here, following symlinks ---------------
 
@@ -64,7 +67,16 @@ trap cleanup EXIT
 FX="$WORKDIR/fx"
 
 # Snapshot of the script's own directory, to prove the suite never writes there.
-DIR_SNAPSHOT="$(cd "$SUT_DIR" && find . \( -type f -o -type l \) | sort)"
+# Paths alone would miss a modified-but-still-present file, and .git is noisy
+# (git may refresh its index while the suite runs), so exclude it and also
+# compare the contents of the two files under test at the end.
+snapshot_paths() {
+    (cd "$SUT_DIR" && find . -path ./.git -prune -o \
+        \( -type f -o -type l \) -print | sort)
+}
+DIR_SNAPSHOT="$(snapshot_paths)"
+SUT_SUM="$(cksum < "$SUT")"
+TEST_SUM="$(cksum < "$SOURCE")"
 
 # ==============================================================================
 # ASSERTIONS
@@ -72,6 +84,7 @@ DIR_SNAPSHOT="$(cd "$SUT_DIR" && find . \( -type f -o -type l \) | sort)"
 
 PASSED=0
 FAILED=0
+SKIPPED=0
 OUT=""
 WHY=""
 
@@ -84,7 +97,8 @@ capture() {
     $VERBOSE && note "    \$ ${*:-}"
     local rc=0
     OUT="$("$@" 2>&1)" || rc=$?
-    OUT="$(printf '%s\n' "$OUT" | sed -e 's/\x1b\[[0-9;]*m//g')"
+    # $'...' turns \x1b into a literal ESC, which both GNU and BSD sed accept.
+    OUT="$(printf '%s\n' "$OUT" | sed -e $'s/\x1b\\[[0-9;]*m//g')"
     return "$rc"
 }
 
@@ -115,6 +129,22 @@ ran_no() {
         FAILED=$((FAILED + 1))
         printf '  %sFAIL%s %s\n' "$RED" "$RESET" "$name"
         printf '        it succeeded: %s\n' "${OUT:-(no output)}"
+    fi
+}
+
+# ran_code <name> <expected-status> <command...>
+ran_code() {
+    local name="$1" want="$2"
+    shift 2
+    local rc=0
+    capture "$@" || rc=$?
+    if ((rc == want)); then
+        PASSED=$((PASSED + 1))
+        $QUIET || printf '  %sPASS%s %s\n' "$GREEN" "$RESET" "$name"
+    else
+        FAILED=$((FAILED + 1))
+        printf '  %sFAIL%s %s\n' "$RED" "$RESET" "$name"
+        printf '        exit %d, wanted %d: %s\n' "$rc" "$want" "${OUT:-(no output)}"
     fi
 }
 
@@ -171,7 +201,20 @@ is_link_to() { [[ -L "$1" && "$(readlink -- "$1")" == "$2" ]]; }
 is_dangling_link() { [[ -L "$1" && ! -e "$1" ]]; }
 # shellcheck disable=SC2329
 has_content() { [[ "$(cat -- "$1" 2> /dev/null)" == "$2" ]]; }
-mode_of() { stat -c '%a' "$1"; }
+# Exact link text, including trailing newlines. A plain $(readlink) would strip
+# them, which is precisely the bug some checks below are about. The sentinel
+# keeps readlink's own terminating newline distinguishable, so only that one is
+# removed.
+# shellcheck disable=SC2329
+link_text_is() {
+    local got
+    got=$(readlink -- "$1" && printf x) || return 1
+    got=${got%x}
+    got=${got%?}
+    [[ "$got" == "$2" ]]
+}
+# GNU stat first, then BSD/macOS.
+mode_of() { stat -c '%a' "$1" 2> /dev/null || stat -f '%Lp' "$1"; }
 
 # mkfix <dir>
 # Builds the standard fixture. Targets are grouped by kind so a section can scan
@@ -525,14 +568,473 @@ if ((EUID != 0)); then
     says "find's complaint is reported" "Permission denied"
     chmod 755 "$U/tree/locked"
 else
-    note "    (running as root: permission-based checks skipped)"
+    SKIPPED=$((SKIPPED + 2))
+    note "    (running as root: 2 permission-based checks skipped)"
+fi
+
+# ------------------------------------------------------------------------------
+section "exact exit codes"
+
+mkfix "$FX/codes"
+C="$FX/codes"
+ran_code "unknown option exits 2" 2 bash "$SUT" --bogus
+ran_code "missing source exits 2" 2 bash "$SUT"
+ran_code "bad search dir exits 2" 2 bash "$SUT" -d "$WORKDIR/nope" "$C/src.conf"
+ran_code "missing source file exits 2" 2 bash "$SUT" -d "$C/tree" "$C/nope.conf"
+ran_code "directory source exits 2" 2 bash "$SUT" -d "$C/tree" "$C/tree/files/a"
+
+# ------------------------------------------------------------------------------
+section "long option aliases"
+
+mkfix "$FX/alias"
+AL="$FX/alias"
+printf 'plain\n' > "$AL/tree/files/a/link.conf"
+
+ran_ok "--test is an alias" bash "$SUT" --test -d "$AL/tree/files/a" "$AL/link.conf"
+says "--test announces itself" "TEST MODE"
+ran_ok "--absolute-link is an alias" bash "$SUT" --absolute-link \
+    -d "$AL/tree/files/a" "$AL/link.conf"
+cond "--absolute-link writes the resolved destination" \
+    link_text_is "$AL/tree/files/a/link.conf" "$AL/target.txt"
+ran_ok "--help exits 0" bash "$SUT" --help
+says "--help shows Usage" "Usage:"
+ran_ok "--version exits 0" bash "$SUT" --version
+says "--version names the tool" "replace_files.sh v"
+
+# ------------------------------------------------------------------------------
+section "missing external command"
+
+STUB="$WORKDIR/stub-bin"
+mkdir -p "$STUB"
+# Every required command except cp, so the startup check fails at cp.
+for c in find ln rm basename dirname readlink mktemp; do
+    ln -s "$(command -v "$c")" "$STUB/$c"
+done
+BASH_BIN="$(command -v bash)"
+ran_code "a missing command exits 3" 3 env PATH="$STUB" "$BASH_BIN" "$SUT" \
+    -d "$FX/codes/tree" "$FX/codes/src.conf"
+says "the missing command is named" "required command not found: cp"
+
+# ------------------------------------------------------------------------------
+section "argument parsing extras"
+
+mkfix "$FX/args"
+G="$FX/args"
+
+ran_code "-- with no source exits 2" 2 bash "$SUT" -t -d "$G/tree" --
+says "-- with no source says so" "Missing source file"
+ran_no "combined short options are rejected" bash "$SUT" -ta -d "$G/tree" "$G/src.conf"
+says "combined options are named" "Unknown option: -ta"
+ran_code "an empty source exits 2" 2 bash "$SUT" -t -d "$G/tree" ""
+says "empty source says it does not exist" "does not exist"
+ran_no "a trailing-slash source is refused" bash "$SUT" -t -d "$G/tree" "$G/src.conf/"
+says "trailing-slash source says it does not exist" "does not exist"
+
+ran_ok "relative and absolute spellings collapse" \
+    bash -c "cd '$G' && bash '$SUT' -t -d tree src.conf '$G/src.conf'"
+says "the duplicate spelling is reported" "same path twice"
+
+ran_ok "repeated -d uses the last value" bash "$SUT" -t \
+    -d "$G/tree/other" -d "$G/tree/files" "$G/src.conf"
+says "repeated -d searches the last root" "Search root: $G/tree/files"
+says "repeated -d replaces there" "would replace [file->file] $G/tree/files/a/src.conf"
+
+STREAM="$WORKDIR/streams"
+mkdir -p "$STREAM"
+capture bash -c "bash '$SUT' -h > '$STREAM/out' 2> '$STREAM/err'"
+cond "-h writes help to stdout" test -s "$STREAM/out"
+cond "-h writes nothing to stderr" test ! -s "$STREAM/err"
+capture bash -c "bash '$SUT' --bogus > '$STREAM/out2' 2> '$STREAM/err2'"
+cond "usage errors write help to stderr" test -s "$STREAM/err2"
+
+# ------------------------------------------------------------------------------
+section "trailing newlines"
+
+mkfix "$FX/nl"
+N="$FX/nl"
+
+TNL=$'trail.conf\n'
+printf 'NEW\n' > "$N/$TNL"
+mkdir -p "$N/tree/tnl"
+printf 'old-real\n' > "$N/tree/tnl/$TNL"
+printf 'decoy\n' > "$N/tree/tnl/trail.conf"
+ran_ok "a trailing-newline source is replaced" bash "$SUT" -d "$N/tree/tnl" "$N/$TNL"
+cond "the trailing-newline target is refreshed" \
+    has_content "$N/tree/tnl/$TNL" "NEW"
+cond "the same-named decoy is untouched" \
+    has_content "$N/tree/tnl/trail.conf" "decoy"
+
+printf 'payload\n' > "$N/dest"
+ln -s $'dest\n' "$N/nl-link.conf"
+mkdir -p "$N/tree/lnl"
+printf 'old\n' > "$N/tree/lnl/nl-link.conf"
+ran_ok "a trailing-newline link text is recreated" \
+    bash "$SUT" -d "$N/tree/lnl" "$N/nl-link.conf"
+cond "the recreated link keeps the newline" \
+    link_text_is "$N/tree/lnl/nl-link.conf" $'dest\n'
+
+RNL=$'root\n'
+mkdir -p "$N/$RNL"
+printf 'old\n' > "$N/$RNL/src.conf"
+ran_ok "a search root ending in a newline works" \
+    bash "$SUT" -t -d "$N/$RNL" "$N/src.conf"
+says "the newline root is searched" \
+    "would replace [file->file] $N/$RNL/src.conf"
+
+SNL=$'srcdir\n'
+mkdir -p "$N/$SNL"
+printf 'SRC\n' > "$N/$SNL/src.conf"
+ran_ok "a source directory ending in a newline works" \
+    bash "$SUT" -t -d "$N/$RNL" "$N/$SNL/src.conf"
+
+# ------------------------------------------------------------------------------
+section "path resolution and environment"
+
+mkfix "$FX/cdpath"
+CP="$FX/cdpath"
+ran_ok "CDPATH does not corrupt a relative root" \
+    bash -c "cd '$CP' && CDPATH='$CP' bash '$SUT' -t -d tree src.conf"
+says "the CDPATH run searches the right root" "Search root: $CP/tree"
+says "the CDPATH run proposes the target" \
+    "would replace [file->file] $CP/tree/files/a/src.conf"
+
+mkfix "$FX/symroot"
+SR="$FX/symroot"
+ln -s tree "$SR/root-link"
+ran_ok "a symlinked search root works" \
+    bash "$SUT" -t -d "$SR/root-link" "$SR/src.conf"
+says "the symlinked root is resolved physically" "Search root: $SR/tree"
+says "the symlinked-root target is proposed" \
+    "would replace [file->file] $SR/tree/files/a/src.conf"
+
+SP="$WORKDIR/space root"
+SPS="$WORKDIR/space-src"
+rm -rf -- "$SP" "$SPS"
+mkdir -p "$SP" "$SPS"
+printf 'old\n' > "$SP/src.conf"
+printf 'SPACE\n' > "$SPS/src.conf"
+ran_ok "a search root with a space works" bash "$SUT" -d "$SP" "$SPS/src.conf"
+cond "the spaced-root target is replaced" has_content "$SP/src.conf" "SPACE"
+
+NLROOT=$'root\nx'
+NLSRC="$WORKDIR/nlsrc"
+rm -rf -- "$WORKDIR/$NLROOT" "$NLSRC"
+mkdir -p "$WORKDIR/$NLROOT" "$NLSRC"
+printf 'old\n' > "$WORKDIR/$NLROOT/src.conf"
+printf 'NL\n' > "$NLSRC/src.conf"
+ran_ok "a search root with an embedded newline works" \
+    bash "$SUT" -t -d "$WORKDIR/$NLROOT" "$NLSRC/src.conf"
+says "the newline root is searched" \
+    "would replace [file->file] $WORKDIR/$NLROOT/src.conf"
+
+# ------------------------------------------------------------------------------
+section "entries that are not candidates"
+
+mkfix "$FX/types"
+TY="$FX/types"
+rm -f -- "$TY/tree/files/a/src.conf"
+mkdir -p "$TY/tree/files/a/src.conf"
+rm -f -- "$TY/tree/links/src.conf"
+if mkfifo "$TY/tree/links/src.conf" 2> /dev/null; then
+    FIFO_OK=true
+else
+    FIFO_OK=false
+    note "    (this filesystem cannot create a fifo: fifo check skipped)"
+    SKIPPED=$((SKIPPED + 1))
+fi
+ran_ok "directories and fifos are ignored" bash "$SUT" -t -d "$TY/tree" "$TY/src.conf"
+says "the real file is proposed" \
+    "would replace [file->file] $TY/tree/files/b/src.conf"
+says_not "the directory is not proposed" "files/a/src.conf"
+says_not "the fifo is not proposed" "links/src.conf"
+cond "the directory is still a directory" test -d "$TY/tree/files/a/src.conf"
+$FIFO_OK && cond "the fifo is still a fifo" test -p "$TY/tree/links/src.conf"
+
+mkfix "$FX/nofollow"
+NF="$FX/nofollow"
+mkdir -p "$NF/outside"
+printf 'OUT\n' > "$NF/outside/src.conf"
+mkdir -p "$NF/tree/plain"
+ln -s ../../outside "$NF/tree/plain/linkdir"
+ran_ok "a symlinked subdirectory is not traversed" \
+    bash "$SUT" -t -d "$NF/tree/plain" "$NF/src.conf"
+says "the linked tree yields no match" "no match for 'src.conf'"
+cond "the tree behind the link is untouched" has_content "$NF/outside/src.conf" "OUT"
+
+# ------------------------------------------------------------------------------
+section "name matching details"
+
+mkfix "$FX/names"
+NM="$FX/names"
+
+mkdir -p "$NM/tree/case"
+printf 'old\n' > "$NM/tree/case/SRC.CONF"
+ran_ok "matching is case-sensitive" bash "$SUT" -t -d "$NM/tree/case" "$NM/src.conf"
+says "a case-different name is not a match" "no match for 'src.conf'"
+cond "the case-different file is untouched" \
+    has_content "$NM/tree/case/SRC.CONF" "old"
+
+printf 'DOT\n' > "$NM/.dot.conf"
+mkdir -p "$NM/tree/dot"
+printf 'old\n' > "$NM/tree/dot/.dot.conf"
+ran_ok "dotfiles are replaced" bash "$SUT" -d "$NM/tree/dot" "$NM/.dot.conf"
+cond "the dotfile target is refreshed" has_content "$NM/tree/dot/.dot.conf" "DOT"
+
+printf 'STAR\n' > "$NM/st*r.conf"
+mkdir -p "$NM/tree/star"
+printf 'old\n' > "$NM/tree/star/st*r.conf"
+printf 'near\n' > "$NM/tree/star/star.conf"
+ran_ok "a literal * is matched" bash "$SUT" -d "$NM/tree/star" "$NM/st*r.conf"
+cond "the literal-* target is refreshed" has_content "$NM/tree/star/st*r.conf" "STAR"
+cond "the * near-miss is untouched" has_content "$NM/tree/star/star.conf" "near"
+
+printf 'QUEST\n' > "$NM/qu?st.conf"
+mkdir -p "$NM/tree/quest"
+printf 'old\n' > "$NM/tree/quest/qu?st.conf"
+printf 'near\n' > "$NM/tree/quest/quest.conf"
+ran_ok "a literal ? is matched" bash "$SUT" -d "$NM/tree/quest" "$NM/qu?st.conf"
+cond "the literal-? target is refreshed" has_content "$NM/tree/quest/qu?st.conf" "QUEST"
+cond "the ? near-miss is untouched" has_content "$NM/tree/quest/quest.conf" "near"
+
+BS='back\slash.conf'
+printf 'BACK\n' > "$NM/$BS"
+mkdir -p "$NM/tree/back"
+printf 'old\n' > "$NM/tree/back/$BS"
+printf 'near\n' > "$NM/tree/back/backslash.conf"
+ran_ok "a literal backslash is matched" bash "$SUT" -d "$NM/tree/back" "$NM/$BS"
+cond "the literal-backslash target is refreshed" has_content "$NM/tree/back/$BS" "BACK"
+cond "the backslash near-miss is untouched" \
+    has_content "$NM/tree/back/backslash.conf" "near"
+
+# ------------------------------------------------------------------------------
+section "multiple sources in one run"
+
+mkfix "$FX/multi"
+MU="$FX/multi"
+printf 'PAY\n' > "$MU/payload"
+printf 'A\n' > "$MU/a.conf"
+ln -s payload "$MU/b.conf"
+printf 'old\n' > "$MU/tree/files/a/a.conf"
+printf 'old\n' > "$MU/tree/files/b/b.conf"
+ran_ok "two sources are replaced in one pass" bash "$SUT" \
+    -d "$MU/tree/files" "$MU/a.conf" "$MU/b.conf"
+says "the summary splits the kinds" "1 real file(s) and 1 symlink(s)"
+cond "the file source is copied" has_content "$MU/tree/files/a/a.conf" "A"
+cond "the link source is recreated" \
+    link_text_is "$MU/tree/files/b/b.conf" "payload"
+
+# ------------------------------------------------------------------------------
+section "link text edge cases"
+
+mkfix "$FX/linktext"
+LX="$FX/linktext"
+
+printf 'old\n' > "$LX/tree/files/a/space.conf"
+ln -s -- '-- weird target' "$LX/space.conf"
+ran_ok "link text with spaces and a leading dash survives" \
+    bash "$SUT" -d "$LX/tree/files/a" "$LX/space.conf"
+cond "the exact link text is recreated" \
+    link_text_is "$LX/tree/files/a/space.conf" '-- weird target'
+
+ln -s /etc/hostname "$LX/abs.conf"
+printf 'old\n' > "$LX/tree/files/b/abs.conf"
+ran_ok "an absolute link text is copied" \
+    bash "$SUT" -d "$LX/tree/files/b" "$LX/abs.conf"
+cond "the absolute text is verbatim" \
+    link_text_is "$LX/tree/files/b/abs.conf" "/etc/hostname"
+
+LNL=$'li\nnk2.conf'
+ln -s payload "$LX/$LNL"
+mkdir -p "$LX/tree/newlink"
+printf 'old\n' > "$LX/tree/newlink/$LNL"
+ran_ok "an embedded-newline target in link mode" \
+    bash "$SUT" -d "$LX/tree/newlink" "$LX/$LNL"
+cond "the newline target became a link" \
+    link_text_is "$LX/tree/newlink/$LNL" "payload"
+
+# ------------------------------------------------------------------------------
+section "-a when resolution fails"
+
+mkfix "$FX/afail"
+AF="$FX/afail"
+ln -s loop.conf "$AF/loop.conf"
+ln -s ../missing/deep/file.conf "$AF/missingparent.conf"
+mkdir -p "$AF/tree/edges"
+printf 'old\n' > "$AF/tree/edges/loop.conf"
+printf 'old\n' > "$AF/tree/edges/missingparent.conf"
+ran_ok "-a falls back to verbatim text" bash "$SUT" -a -d "$AF/tree/edges" \
+    "$AF/loop.conf" "$AF/missingparent.conf"
+count=$(printf '%s\n' "$OUT" | grep -c 'cannot resolve' || true)
+cond "both unresolvable links warn" test "$count" -eq 2
+cond "the loop link keeps its text" \
+    link_text_is "$AF/tree/edges/loop.conf" "loop.conf"
+cond "the missing-parent link keeps its text" \
+    link_text_is "$AF/tree/edges/missingparent.conf" "../missing/deep/file.conf"
+
+# ------------------------------------------------------------------------------
+section "partial failures and dry-run limits"
+
+mkfix "$FX/partial"
+PF="$FX/partial"
+printf 'A\n' > "$PF/a.conf"
+printf 'B\n' > "$PF/b.conf"
+mkdir -p "$PF/tree/ro" "$PF/tree/ok"
+printf 'old\n' > "$PF/tree/ro/a.conf"
+chmod 444 "$PF/tree/ro/a.conf"
+chmod 555 "$PF/tree/ro"
+printf 'old\n' > "$PF/tree/ok/b.conf"
+if ((EUID != 0)); then
+    ran_code "a failed source does not abort the run" 1 bash "$SUT" \
+        -d "$PF/tree" "$PF/a.conf" "$PF/b.conf"
+    says "the later source is still processed" \
+        "[file->file] $PF/tree/ok/b.conf"
+    says "the summary counts the success" "1 real file(s)"
+    cond "the failed target keeps its content" \
+        has_content "$PF/tree/ro/a.conf" "old"
+    chmod 755 "$PF/tree/ro"
+    chmod 644 "$PF/tree/ro/a.conf"
+else
+    SKIPPED=$((SKIPPED + 1))
+    note "    (running as root: partial-failure check skipped)"
+fi
+
+mkdir -p "$PF/tree/rolink"
+printf 'precious\n' > "$PF/precious"
+ln -s ../../precious "$PF/tree/rolink/src.conf"
+chmod 555 "$PF/tree/rolink"
+if ((EUID != 0)); then
+    ran_code "a symlink that cannot be removed fails" 1 bash "$SUT" \
+        -d "$PF/tree/rolink" "$PF/src.conf"
+    says "the removal failure is reported" "failed to remove symlink"
+    cond "the link survives the failed removal" \
+        test -L "$PF/tree/rolink/src.conf"
+    chmod 755 "$PF/tree/rolink"
+else
+    SKIPPED=$((SKIPPED + 1))
+    note "    (running as root: removal-failure check skipped)"
+    chmod 755 "$PF/tree/rolink"
+fi
+
+mkdir -p "$PF/tree/dryro"
+printf 'old\n' > "$PF/tree/dryro/src.conf"
+chmod 444 "$PF/tree/dryro/src.conf"
+chmod 555 "$PF/tree/dryro"
+ran_ok "dry run ignores write permission" \
+    bash "$SUT" -t -d "$PF/tree/dryro" "$PF/src.conf"
+says "dry run still predicts the replacement" "would replace [file->file]"
+chmod 755 "$PF/tree/dryro"
+chmod 644 "$PF/tree/dryro/src.conf"
+
+# ------------------------------------------------------------------------------
+section "replacement safety"
+
+mkfix "$FX/safety"
+SY="$FX/safety"
+
+printf 'precious\n' > "$SY/precious"
+mkdir -p "$SY/tree/pointee"
+ln -s ../../precious "$SY/tree/pointee/src.conf"
+ran_ok "replacing a link does not touch its pointee" \
+    bash "$SUT" -d "$SY/tree/pointee" "$SY/src.conf"
+cond "the pointee is untouched" has_content "$SY/precious" "precious"
+cond "the link target is now a real file" \
+    is_real_file "$SY/tree/pointee/src.conf"
+
+printf 'side\n' > "$SY/side.txt"
+mkdir -p "$SY/tree/hard"
+ln "$SY/side.txt" "$SY/tree/hard/src.conf"
+ran_ok "a hardlinked target is replaced in place" \
+    bash "$SUT" -d "$SY/tree/hard" "$SY/src.conf"
+cond "the hardlinked target holds the source" \
+    has_content "$SY/tree/hard/src.conf" "FRESH"
+# cp(1) truncates in place, so the sibling hardlink changes too. Pinned here so
+# that a future change to that semantic is deliberate (and documented).
+cond "the target's hardlink sibling also changes" \
+    has_content "$SY/side.txt" "FRESH"
+
+if ((EUID != 0)); then
+    mkdir -p "$SY/tree/readonly"
+    printf 'old\n' > "$SY/tree/readonly/src.conf"
+    chmod 444 "$SY/tree/readonly/src.conf"
+    want_mode="$(mode_of "$SY/src.conf")"
+    ran_ok "a read-only target is replaced through cp -f" \
+        bash "$SUT" -d "$SY/tree/readonly" "$SY/src.conf"
+    # README used to promise the destination mode is always kept; cp -f has to
+    # unlink and recreate a read-only target, so it adopts the source's mode.
+    cond "the read-only target adopts the source mode" \
+        test "$(mode_of "$SY/tree/readonly/src.conf")" = "$want_mode"
+    chmod 644 "$SY/tree/readonly/src.conf"
+else
+    SKIPPED=$((SKIPPED + 1))
+    note "    (running as root: read-only-mode check skipped)"
+fi
+
+# ------------------------------------------------------------------------------
+section "unreadable sources and roots"
+
+if ((EUID != 0)); then
+    mkfix "$FX/unreadsrc"
+    US="$FX/unreadsrc"
+    printf 'precious\n' > "$US/precious"
+    mkdir -p "$US/tree/lost"
+    ln -s ../../precious "$US/tree/lost/src.conf"
+    chmod 000 "$US/src.conf"
+    ran_code "an unreadable file source is refused" 2 bash "$SUT" \
+        -d "$US/tree/lost" "$US/src.conf"
+    says "the unreadable source is named" "is not readable"
+    cond "the target link survives the refused run" \
+        test -L "$US/tree/lost/src.conf"
+    chmod 644 "$US/src.conf"
+
+    mkfix "$FX/unreadroot"
+    UR="$FX/unreadroot"
+    mkdir -p "$UR/locked"
+    printf 'old\n' > "$UR/locked/src.conf"
+    chmod 000 "$UR/locked"
+    ran_code "an unreadable search root exits 2" 2 bash "$SUT" \
+        -d "$UR/locked" "$UR/src.conf"
+    says "the unreadable root is reported cleanly" "cannot enter search root"
+    says_not "no raw cd error is printed" "cd:"
+    chmod 755 "$UR/locked"
+else
+    SKIPPED=$((SKIPPED + 5))
+    note "    (running as root: 5 unreadable-source/root checks skipped)"
+fi
+
+# ------------------------------------------------------------------------------
+section "temporary files"
+
+TT="$WORKDIR/tmpdir"
+mkdir -p "$TT"
+mkfix "$FX/tmp"
+TP="$FX/tmp"
+ran_ok "a clean run leaves no temp files" \
+    env TMPDIR="$TT" bash "$SUT" -t -d "$TP/tree/files" "$TP/src.conf"
+cond "TMPDIR is empty after success" test -z "$(ls -A "$TT")"
+
+mkdir -p "$TP/tree/locked"
+printf 'x\n' > "$TP/tree/locked/src.conf"
+chmod 000 "$TP/tree/locked"
+if ((EUID != 0)); then
+    ran_code "a failing scan leaves no temp files" 1 \
+        env TMPDIR="$TT" bash "$SUT" -t -d "$TP/tree" "$TP/src.conf"
+    cond "TMPDIR is empty after failure" test -z "$(ls -A "$TT")"
+    chmod 755 "$TP/tree/locked"
+else
+    SKIPPED=$((SKIPPED + 1))
+    note "    (running as root: failing-scan cleanup check skipped)"
+    chmod 755 "$TP/tree/locked"
 fi
 
 # ------------------------------------------------------------------------------
 section "the repository is left alone"
 
 cond "the script under test is unchanged" \
-    test "$(cd "$SUT_DIR" && find . \( -type f -o -type l \) | sort)" = "$DIR_SNAPSHOT"
+    test "$SUT_SUM" = "$(cksum < "$SUT")"
+cond "this suite is unchanged" \
+    test "$TEST_SUM" = "$(cksum < "$SOURCE")"
+cond "the repository file list is unchanged" \
+    test "$DIR_SNAPSHOT" = "$(snapshot_paths)"
 
 # ==============================================================================
 note ""
@@ -540,8 +1042,12 @@ $QUIET || printf '%b%s%b\n' "$CYAN" \
     "----------------------------------------------------------------------" "$RESET"
 
 if ((FAILED > 0)); then
-    printf '%b  %d passed, %d FAILED%b\n' "$RED" "$PASSED" "$FAILED" "$RESET"
+    printf '%b  %d passed, %d FAILED%b' "$RED" "$PASSED" "$FAILED" "$RESET"
+    ((SKIPPED > 0)) && printf ', %d skipped' "$SKIPPED"
+    printf '\n'
     exit 1
 fi
-printf '%b  %d passed%b\n' "$GREEN" "$PASSED" "$RESET"
+printf '%b  %d passed%b' "$GREEN" "$PASSED" "$RESET"
+((SKIPPED > 0)) && printf ', %d skipped' "$SKIPPED"
+printf '\n'
 exit 0

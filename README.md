@@ -2,7 +2,7 @@
 
 Recursively walks a directory tree and replaces every file or symlink whose basename matches a given (set of) source file(s) with a fresh copy or recreated link, so that after a run the targets always take on the source's kind (real file vs. symlink).
 
-**Version:** 1.0 · **Author:** Gino Bogo · **License:** MIT
+**Version:** 1.1 · **Author:** Gino Bogo · **License:** MIT
 
 ## Contents
 
@@ -102,12 +102,16 @@ Glob metacharacters in a source's basename (`*`, `?`, `[`, `]`, `\`) are treated
 
 | Source kind | Target kind | Result |
 | --- | --- | --- |
-| Real file | Real file | Content replaced (`cp -f`); destination **mode/owner** preserved. |
+| Real file | Real file | Content replaced (`cp -f`); destination **mode/owner** preserved while it can be written in place. |
 | Real file | Symlink  | Link removed; a real file takes its place. |
 | Symlink  | Real file | File removed; source link recreated. |
 | Symlink  | Symlink  | Link removed; source link recreated. |
 
 In other words, the target always ends up carrying the source's kind.
+
+If a real-file target is not writable but its directory is, `cp -f` unlinks and
+recreates it, so the new file takes the **source's** mode rather than the old
+target's mode.
 
 ## How It Works
 
@@ -156,18 +160,22 @@ In test mode the run also prints `TEST MODE: no files were modified` / `would re
 | Code | Meaning |
 | --- | --- |
 | `0` | Success (warnings allowed). A clean run that replaced nothing still exits 0 (explicitly set, not inherited). |
-| `1` | At least one copy/link operation failed. |
-| `2` | Bad usage or an unusable source (missing/unknown option, missing source, directory/fifo source, duplicate basename, bad search dir, Bash < 4). |
+| `1` | At least one copy/link operation or directory scan failed. |
+| `2` | Bad usage or an unusable input (missing/unknown option, missing source, directory/fifo source, duplicate basename, unreadable source, unreadable search root, bad search dir, Bash < 4). |
 | `3` | A required external command is missing. |
 
 ## Behavioral Notes
 
 - **Symlinks are never followed during the scan.** A target sitting inside a symlinked directory is not visited, and the source directory tree is not traversed via links.
 - **The source itself is skipped** (and never copied onto itself), including when reached under another spelling as the same inode in file mode.
-- **Mode/ownership:** when refreshing a real file with a real-file source, `cp -f` preserves the destination's existing mode (verified by tests); ownership follows `cp`'s default behavior.
+- **Byte-exact names:** source basenames, search roots and symlink text are handled exactly, including trailing newlines. Glob characters in a basename stay literal.
+- **Mode/ownership:** when refreshing a writable real file with a real-file source, `cp -f` preserves the destination's existing mode (verified by tests); ownership follows `cp`'s default behavior. A read-only target in a writable directory is unlinked and recreated, so it adopts the source's mode instead.
+- **Hardlinked targets:** `cp` truncates an existing target in place, so replacing a target that is hardlinked to another name also changes that other name.
+- **Unreadable sources** are refused up front (exit `2`) for real-file sources, before any target is removed. A source that becomes unreadable mid-run, or a full destination filesystem, can still leave a removed symlink target missing.
 - **Dangling source links** are accepted (with a warning); targets become dangling links too. With `-a`, a dangling source resolves to its intended destination as long as the parent directory exists (GNU `readlink -f`).
 - **A source link pointing at a directory** is accepted (with a warning) — targets become directory links.
 - **Verification:** after creating a link, the script checks `[[ -e "$target" ]]` and warns "created link is dangling" when it does not resolve.
+- **Dry run:** predicts replacements but does not test write permissions. A real run can still fail where `-t` reported "would replace".
 - **Color:** ANSI color codes are always emitted (no `--color` flag). Tests strip them.
 - **Concurrency:** the script is single-threaded; no locking is provided. Running two instances against the same tree concurrently is unsafe.
 - **Temps:** `find`'s stderr is captured in an `mktemp` file registered in `TMP_FILES` and removed via an `EXIT` trap (including on abort).
@@ -221,7 +229,7 @@ bash tests/test_replace_files.sh -q       # failures + summary only
 bash tests/test_replace_files.sh -v       # verbose
 ```
 
-The suite builds fresh fixture trees under a temp directory and never writes into the repository (it snapshots the repo file list and asserts it is unchanged). It exercises the CLI surface, file/symlink targets, skip rules, link modes (verbatim vs. `-a`), edge cases (dangling/directory sources), literal names with spaces/brackets/newlines, the search-root forms, dry run, none/match, failures, and repository immutability.
+The suite builds fresh fixture trees under a temp directory and never writes into the repository (it snapshots the repo file list and checks file contents and asserts they are unchanged). It exercises the CLI surface, file/symlink targets, skip rules, link modes (verbatim vs. `-a`), edge cases (dangling/directory sources), literal names with spaces/brackets/newlines, newline-exact names and link text, search-root forms (including `CDPATH` and symlinked roots), multiple/mixed sources, dry run, none/match, unreadable sources and roots, permission failures, exact exit codes, temp cleanup, and repository immutability.
 
 ## Disclaimer
 

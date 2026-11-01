@@ -19,7 +19,7 @@ set -euo pipefail
 # GLOBAL CONFIGURATION
 # ==============================================================================
 
-SCRIPT_VERSION="1.0"
+SCRIPT_VERSION="1.1"
 
 # Associative arrays (duplicate detection) need bash 4.
 if ((BASH_VERSINFO[0] < 4)); then
@@ -199,8 +199,16 @@ if [[ ! -d "$SEARCH_DIR" ]]; then
 fi
 
 # Physical path: find output is compared string-wise against a source's resolved
-# path, so both sides must be spelled the same way.
-SEARCH_ABS="$(cd "$SEARCH_DIR" && pwd -P)"
+# path, so both sides must be spelled the same way. The sentinel keeps trailing
+# newlines that belong to the directory name; the second strip removes only the
+# newline that cd/pwd append. CDPATH= stops cd from printing the directory into
+# the capture when a relative root is found through it.
+if ! SEARCH_ABS="$(CDPATH= cd -- "$SEARCH_DIR" 2> /dev/null && pwd -P && printf x)"; then
+    log_err "cannot enter search root '$SEARCH_DIR'."
+    exit 2
+fi
+SEARCH_ABS="${SEARCH_ABS%x}"
+SEARCH_ABS="${SEARCH_ABS%?}"
 
 # ==============================================================================
 # ENVIRONMENT INITIALIZATION
@@ -235,12 +243,36 @@ for src in "${SOURCE_FILES[@]}"; do
         exit 2
     fi
 
-    if ! src_dir="$(cd -- "$(dirname -- "$src")" 2> /dev/null && pwd -P)"; then
+    # A real-file source must be readable before any target is unlinked: in FILE
+    # mode a symlink target is removed first, and a failing cp would otherwise
+    # leave nothing behind. A LINK source may dangle; readlink still works.
+    if [[ "$mode" == "FILE" && ! -r "$src" ]]; then
+        log_err "'$src' is not readable."
+        exit 2
+    fi
+
+    # Sentinel captures: command substitution strips trailing newlines, which
+    # can be part of a name. Strip the sentinel, then only the newline the
+    # command itself appends.
+    if ! src_parent="$(dirname -- "$src" && printf x)"; then
         log_err "cannot resolve the directory of '$src'."
         exit 2
     fi
-    abs="$src_dir/$(basename -- "$src")"
-    name=$(basename -- "$src")
+    src_parent="${src_parent%x}"
+    src_parent="${src_parent%?}"
+    if ! src_dir="$(CDPATH= cd -- "$src_parent" 2> /dev/null && pwd -P && printf x)"; then
+        log_err "cannot resolve the directory of '$src'."
+        exit 2
+    fi
+    src_dir="${src_dir%x}"
+    src_dir="${src_dir%?}"
+    if ! name="$(basename -- "$src" && printf x)"; then
+        log_err "cannot read the name of '$src'."
+        exit 2
+    fi
+    name="${name%x}"
+    name="${name%?}"
+    abs="$src_dir/$name"
 
     # The same path twice is harmless and collapses to one replacement. Two
     # different files with the same name are not: matching is by name, so one
@@ -260,10 +292,12 @@ for src in "${SOURCE_FILES[@]}"; do
 
     link_dest=""
     if [[ "$mode" == "LINK" ]]; then
-        if ! link_dest="$(readlink -- "$src")"; then
+        if ! link_dest="$(readlink -- "$src" && printf x)"; then
             log_err "cannot read the link '$src'."
             exit 2
         fi
+        link_dest="${link_dest%x}"
+        link_dest="${link_dest%?}"
         if [[ ! -e "$src" ]]; then
             log_warn "'$src' is a dangling symlink; the copies will be dangling too."
         elif [[ -d "$src" ]]; then
@@ -274,7 +308,10 @@ for src in "${SOURCE_FILES[@]}"; do
             # component, because GNU readlink -f only requires the parent to
             # exist. A loop or a missing parent directory fails, and then the
             # verbatim text is the only thing left to write.
-            if resolved="$(readlink -f -- "$src" 2> /dev/null)" && [[ -n "$resolved" ]]; then
+            if resolved="$(readlink -f -- "$src" 2> /dev/null && printf x)" \
+                && [[ -n "${resolved%x}" ]]; then
+                resolved="${resolved%x}"
+                resolved="${resolved%?}"
                 link_dest="$resolved"
             else
                 log_warn "cannot resolve '$src' to an absolute destination; writing its text verbatim."
@@ -392,7 +429,9 @@ for idx in "${!SRC_ABS[@]}"; do
     name="${SRC_NAME[$idx]}"
     mode="${SRC_MODE[$idx]}"
     link_dest="${SRC_LINK[$idx]}"
-    pattern="$(glob_escape "$name")"
+    # glob_escape prints no terminator, so only the sentinel is stripped here.
+    pattern="$(glob_escape "$name" && printf x)"
+    pattern="${pattern%x}"
 
     log_info "Source[$((idx + 1))/$SRC_COUNT]: $src [$mode]"
     log_info "Searching '$SEARCH_ABS' for '$name' ..."
@@ -401,7 +440,12 @@ for idx in "${!SRC_ABS[@]}"; do
     # find never follows links, so the -type l branch reports the link itself
     # rather than whatever it points at, and links inside the tree are visited.
     # -print0 / read -d '' keeps names with spaces or newlines in one piece.
-    find_err=$(mktemp) || { log_err "cannot create a temporary file."; exit 1; }
+    if ! find_err="$(mktemp && printf x)"; then
+        log_err "cannot create a temporary file."
+        exit 1
+    fi
+    find_err="${find_err%x}"
+    find_err="${find_err%?}"
     TMP_FILES+=("$find_err")
 
     matches=0
